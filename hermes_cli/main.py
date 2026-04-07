@@ -921,6 +921,7 @@ def select_provider_and_model(args=None):
         "copilot-acp": "GitHub Copilot ACP",
         "copilot": "GitHub Copilot",
         "anthropic": "Anthropic",
+        "gemini": "Google AI Studio",
         "zai": "Z.AI / GLM",
         "kimi-coding": "Kimi / Moonshot",
         "minimax": "MiniMax",
@@ -952,6 +953,7 @@ def select_provider_and_model(args=None):
 
     extended_providers = [
         ("copilot-acp", "GitHub Copilot ACP (spawns `copilot --acp --stdio`)"),
+        ("gemini", "Google AI Studio (Gemini models — OpenAI-compatible endpoint)"),
         ("zai", "Z.AI / GLM (Zhipu AI direct API)"),
         ("kimi-coding", "Kimi / Moonshot (Moonshot AI direct API)"),
         ("minimax", "MiniMax (global direct API)"),
@@ -1055,7 +1057,7 @@ def select_provider_and_model(args=None):
         _model_flow_anthropic(config, current_model)
     elif selected_provider == "kimi-coding":
         _model_flow_kimi(config, current_model)
-    elif selected_provider in ("zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba", "huggingface"):
+    elif selected_provider in ("gemini", "zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba", "huggingface"):
         _model_flow_api_key_provider(config, selected_provider, current_model)
 
 
@@ -1152,7 +1154,7 @@ def _model_flow_nous(config, current_model="", args=None):
     from hermes_cli.auth import (
         get_provider_auth_state, _prompt_model_selection, _save_model_choice,
         _update_config_for_provider, resolve_nous_runtime_credentials,
-        fetch_nous_models, AuthError, format_auth_error,
+        AuthError, format_auth_error,
         _login_nous, PROVIDER_REGISTRY,
     )
     from hermes_cli.config import get_env_value, save_config, save_env_value
@@ -1193,13 +1195,14 @@ def _model_flow_nous(config, current_model="", args=None):
     # Already logged in — use curated model list (same as OpenRouter defaults).
     # The live /models endpoint returns hundreds of models; the curated list
     # shows only agentic models users recognize from OpenRouter.
-    from hermes_cli.models import _PROVIDER_MODELS, get_pricing_for_provider
+    from hermes_cli.models import (
+        _PROVIDER_MODELS, get_pricing_for_provider, filter_nous_free_models,
+        check_nous_free_tier, partition_nous_models_by_tier,
+    )
     model_ids = _PROVIDER_MODELS.get("nous", [])
     if not model_ids:
         print("No curated models available for Nous Portal.")
         return
-
-    print(f"Showing {len(model_ids)} curated models — use \"Enter custom model name\" for others.")
 
     # Verify credentials are still valid (catches expired sessions early)
     try:
@@ -1226,7 +1229,44 @@ def _model_flow_nous(config, current_model="", args=None):
     # Fetch live pricing (non-blocking — returns empty dict on failure)
     pricing = get_pricing_for_provider("nous")
 
-    selected = _prompt_model_selection(model_ids, current_model=current_model, pricing=pricing)
+    # Check if user is on free tier
+    free_tier = check_nous_free_tier()
+
+    # For both tiers: apply the allowlist filter first (removes non-allowlisted
+    # free models and allowlist models that aren't actually free).
+    # Then for free users: partition remaining models into selectable/unavailable.
+    model_ids = filter_nous_free_models(model_ids, pricing)
+    unavailable_models: list[str] = []
+    if free_tier:
+        model_ids, unavailable_models = partition_nous_models_by_tier(model_ids, pricing, free_tier=True)
+
+    if not model_ids and not unavailable_models:
+        print("No models available for Nous Portal after filtering.")
+        return
+
+    # Resolve portal URL for upgrade links (may differ on staging)
+    _nous_portal_url = ""
+    try:
+        _nous_state = get_provider_auth_state("nous")
+        if _nous_state:
+            _nous_portal_url = _nous_state.get("portal_base_url", "")
+    except Exception:
+        pass
+
+    if free_tier and not model_ids:
+        print("No free models currently available.")
+        if unavailable_models:
+            from hermes_cli.auth import DEFAULT_NOUS_PORTAL_URL
+            _url = (_nous_portal_url or DEFAULT_NOUS_PORTAL_URL).rstrip("/")
+            print(f"Upgrade at {_url} to access paid models.")
+        return
+
+    print(f"Showing {len(model_ids)} curated models — use \"Enter custom model name\" for others.")
+
+    selected = _prompt_model_selection(
+        model_ids, current_model=current_model, pricing=pricing,
+        unavailable_models=unavailable_models, portal_url=_nous_portal_url,
+    )
     if selected:
         _save_model_choice(selected)
         # Reactivate Nous as the provider and update config
@@ -1274,7 +1314,6 @@ def _model_flow_openai_codex(config, current_model=""):
         PROVIDER_REGISTRY, DEFAULT_CODEX_BASE_URL,
     )
     from hermes_cli.codex_models import get_codex_model_ids
-    from hermes_cli.config import get_env_value, save_env_value
     import argparse
 
     status = get_codex_auth_status()
@@ -1292,12 +1331,21 @@ def _model_flow_openai_codex(config, current_model=""):
             return
 
     _codex_token = None
+    # Prefer credential pool (where `hermes auth` stores device_code tokens),
+    # fall back to legacy provider state.
     try:
-        from hermes_cli.auth import resolve_codex_runtime_credentials
-        _codex_creds = resolve_codex_runtime_credentials()
-        _codex_token = _codex_creds.get("api_key")
+        _codex_status = get_codex_auth_status()
+        if _codex_status.get("logged_in"):
+            _codex_token = _codex_status.get("api_key")
     except Exception:
         pass
+    if not _codex_token:
+        try:
+            from hermes_cli.auth import resolve_codex_runtime_credentials
+            _codex_creds = resolve_codex_runtime_credentials()
+            _codex_token = _codex_creds.get("api_key")
+        except Exception:
+            pass
 
     codex_models = get_codex_model_ids(access_token=_codex_token)
 
@@ -1318,7 +1366,7 @@ def _model_flow_custom(config):
     so it appears in the provider menu on subsequent runs.
     """
     from hermes_cli.auth import _save_model_choice, deactivate_provider
-    from hermes_cli.config import get_env_value, save_env_value, load_config, save_config
+    from hermes_cli.config import get_env_value, load_config, save_config
 
     current_url = get_env_value("OPENAI_BASE_URL") or ""
     current_key = get_env_value("OPENAI_API_KEY") or ""
@@ -1580,7 +1628,7 @@ def _model_flow_named_custom(config, provider_info):
     Otherwise probes the endpoint's /models API to let the user pick one.
     """
     from hermes_cli.auth import _save_model_choice, deactivate_provider
-    from hermes_cli.config import save_env_value, load_config, save_config
+    from hermes_cli.config import load_config, save_config
     from hermes_cli.models import fetch_api_models
 
     name = provider_info["name"]
@@ -1790,7 +1838,7 @@ def _model_flow_copilot(config, current_model=""):
         deactivate_provider,
         resolve_api_key_provider_credentials,
     )
-    from hermes_cli.config import get_env_value, save_env_value, load_config, save_config
+    from hermes_cli.config import save_env_value, load_config, save_config
     from hermes_cli.models import (
         fetch_api_models,
         fetch_github_model_catalog,
@@ -2209,24 +2257,37 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         save_env_value(base_url_env, override)
         effective_base = override
 
-    # Model selection — try live /models endpoint first, fall back to defaults.
-    # Providers with large live catalogs (100+ models) use a curated list instead
-    # so users see familiar model names rather than an overwhelming dump.
+    # Model selection — resolution order:
+    #   1. models.dev registry (cached, filtered for agentic/tool-capable models)
+    #   2. Curated static fallback list (offline insurance)
+    #   3. Live /models endpoint probe (small providers without models.dev data)
     curated = _PROVIDER_MODELS.get(provider_id, [])
-    if curated and len(curated) >= 8:
+
+    # Try models.dev first — returns tool-capable models, filtered for noise
+    mdev_models: list = []
+    try:
+        from agent.models_dev import list_agentic_models
+        mdev_models = list_agentic_models(provider_id)
+    except Exception:
+        pass
+
+    if mdev_models:
+        model_list = mdev_models
+        print(f"  Found {len(model_list)} model(s) from models.dev registry")
+    elif curated and len(curated) >= 8:
         # Curated list is substantial — use it directly, skip live probe
-        live_models = None
+        model_list = curated
+        print(f"  Showing {len(model_list)} curated models — use \"Enter custom model name\" for others.")
     else:
         api_key_for_probe = existing_key or (get_env_value(key_env) if key_env else "")
         live_models = fetch_api_models(api_key_for_probe, effective_base)
-
-    if live_models and len(live_models) >= len(curated):
-        model_list = live_models
-        print(f"  Found {len(model_list)} model(s) from {pconfig.name} API")
-    else:
-        model_list = curated
-        if model_list:
-            print(f"  Showing {len(model_list)} curated models — use \"Enter custom model name\" for others.")
+        if live_models and len(live_models) >= len(curated):
+            model_list = live_models
+            print(f"  Found {len(model_list)} model(s) from {pconfig.name} API")
+        else:
+            model_list = curated
+            if model_list:
+                print(f"  Showing {len(model_list)} curated models — use \"Enter custom model name\" for others.")
         # else: no defaults either, will fall through to raw input
 
     if provider_id in {"opencode-zen", "opencode-go"}:
@@ -2367,8 +2428,6 @@ def _model_flow_anthropic(config, current_model=""):
         save_anthropic_api_key,
     )
     from hermes_cli.models import _PROVIDER_MODELS
-
-    pconfig = PROVIDER_REGISTRY["anthropic"]
 
     # Check ALL credential sources
     existing_key = (
@@ -3542,7 +3601,7 @@ def cmd_update(args):
         try:
             from hermes_cli.profiles import list_profiles, get_active_profile_name, seed_profile_skills
             active = get_active_profile_name()
-            other_profiles = [p for p in list_profiles() if not p.is_default and p.name != active]
+            other_profiles = [p for p in list_profiles() if p.name != active]
             if other_profiles:
                 print()
                 print("→ Syncing bundled skills to other profiles...")
@@ -3638,7 +3697,7 @@ def cmd_update(args):
         try:
             from hermes_cli.gateway import (
                 is_macos, is_linux, _ensure_user_systemd_env,
-                get_systemd_linger_status, find_gateway_pids,
+                find_gateway_pids,
                 _get_service_pids,
             )
             import signal as _signal
@@ -3794,7 +3853,7 @@ def cmd_profile(args):
     """Profile management — create, delete, list, switch, alias."""
     from hermes_cli.profiles import (
         list_profiles, create_profile, delete_profile, seed_profile_skills,
-        get_active_profile, set_active_profile, get_active_profile_name,
+        set_active_profile, get_active_profile_name,
         check_alias_collision, create_wrapper_script, remove_wrapper_script,
         _is_wrapper_dir_in_path, _get_wrapper_dir,
     )
@@ -3922,7 +3981,6 @@ def cmd_profile(args):
             print(f"  {name} chat               Start chatting")
             print(f"  {name} gateway start      Start the messaging gateway")
             if clone or clone_all:
-                from hermes_constants import get_hermes_home
                 profile_dir_display = f"~/.hermes/profiles/{name}"
                 print(f"\n  Edit {profile_dir_display}/.env for different API keys")
                 print(f"  Edit {profile_dir_display}/SOUL.md for different personality")
@@ -4182,7 +4240,7 @@ For more help on a command:
     )
     chat_parser.add_argument(
         "--provider",
-        choices=["auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot", "anthropic", "huggingface", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode"],
+        choices=["auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot", "anthropic", "gemini", "huggingface", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode"],
         default=None,
         help="Inference provider (default: auto)"
     )
@@ -4345,7 +4403,7 @@ For more help on a command:
     gateway_uninstall.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
 
     # gateway setup
-    gateway_setup = gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
+    gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
     gateway_parser.set_defaults(func=cmd_gateway)
     
@@ -4620,10 +4678,10 @@ For more help on a command:
     config_subparsers = config_parser.add_subparsers(dest="config_command")
     
     # config show (default)
-    config_show = config_subparsers.add_parser("show", help="Show current configuration")
+    config_subparsers.add_parser("show", help="Show current configuration")
     
     # config edit
-    config_edit = config_subparsers.add_parser("edit", help="Open config file in editor")
+    config_subparsers.add_parser("edit", help="Open config file in editor")
     
     # config set
     config_set = config_subparsers.add_parser("set", help="Set a configuration value")
@@ -4631,16 +4689,16 @@ For more help on a command:
     config_set.add_argument("value", nargs="?", help="Value to set")
     
     # config path
-    config_path = config_subparsers.add_parser("path", help="Print config file path")
+    config_subparsers.add_parser("path", help="Print config file path")
     
     # config env-path
-    config_env = config_subparsers.add_parser("env-path", help="Print .env file path")
+    config_subparsers.add_parser("env-path", help="Print .env file path")
     
     # config check
-    config_check = config_subparsers.add_parser("check", help="Check for missing/outdated config")
+    config_subparsers.add_parser("check", help="Check for missing/outdated config")
     
     # config migrate
-    config_migrate = config_subparsers.add_parser("migrate", help="Update config with new options")
+    config_subparsers.add_parser("migrate", help="Update config with new options")
     
     config_parser.set_defaults(func=cmd_config)
     
@@ -4654,7 +4712,7 @@ For more help on a command:
     )
     pairing_sub = pairing_parser.add_subparsers(dest="pairing_action")
 
-    pairing_list_parser = pairing_sub.add_parser("list", help="Show pending + approved users")
+    pairing_sub.add_parser("list", help="Show pending + approved users")
 
     pairing_approve_parser = pairing_sub.add_parser("approve", help="Approve a pairing code")
     pairing_approve_parser.add_argument("platform", help="Platform name (telegram, discord, slack, whatsapp)")
@@ -4664,7 +4722,7 @@ For more help on a command:
     pairing_revoke_parser.add_argument("platform", help="Platform name")
     pairing_revoke_parser.add_argument("user_id", help="User ID to revoke")
 
-    pairing_clear_parser = pairing_sub.add_parser("clear-pending", help="Clear all pending codes")
+    pairing_sub.add_parser("clear-pending", help="Clear all pending codes")
 
     def cmd_pairing(args):
         from hermes_cli.pairing import pairing_command
@@ -4840,7 +4898,7 @@ For more help on a command:
     memory_sub = memory_parser.add_subparsers(dest="memory_command")
     memory_sub.add_parser("setup", help="Interactive provider selection and configuration")
     memory_sub.add_parser("status", help="Show current memory provider config")
-    memory_off_p = memory_sub.add_parser("off", help="Disable external provider (built-in only)")
+    memory_sub.add_parser("off", help="Disable external provider (built-in only)")
 
     def cmd_memory(args):
         sub = getattr(args, "memory_command", None)
@@ -5004,7 +5062,7 @@ For more help on a command:
     sessions_prune.add_argument("--source", help="Only prune sessions from this source")
     sessions_prune.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
 
-    sessions_stats = sessions_subparsers.add_parser("stats", help="Show session store statistics")
+    sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
     sessions_rename = sessions_subparsers.add_parser("rename", help="Set or change a session's title")
     sessions_rename.add_argument("session_id", help="Session ID to rename")
@@ -5364,7 +5422,7 @@ For more help on a command:
     )
     profile_subparsers = profile_parser.add_subparsers(dest="profile_action")
 
-    profile_list = profile_subparsers.add_parser("list", help="List all profiles")
+    profile_subparsers.add_parser("list", help="List all profiles")
     profile_use = profile_subparsers.add_parser("use", help="Set sticky default profile")
     profile_use.add_argument("profile_name", help="Profile name (or 'default')")
 

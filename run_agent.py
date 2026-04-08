@@ -66,7 +66,8 @@ from model_tools import (
     handle_function_call,
     check_toolset_requirements,
 )
-from tools.terminal_tool import cleanup_vm
+from tools.terminal_tool import cleanup_vm, get_active_env
+from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
@@ -75,6 +76,7 @@ from hermes_constants import OPENROUTER_BASE_URL
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block
+from agent.retry_utils import jittered_backoff
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
@@ -85,6 +87,7 @@ from agent.model_metadata import (
     estimate_tokens_rough, estimate_messages_tokens_rough, estimate_request_tokens_rough,
     get_next_probe_tier, parse_context_limit_from_error,
     save_context_length, is_local_endpoint,
+    query_ollama_num_ctx,
 )
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
@@ -408,63 +411,6 @@ def _strip_budget_warnings_from_history(messages: list) -> None:
 # =========================================================================
 # Large tool result handler — save oversized output to temp file
 # =========================================================================
-
-# Threshold at which tool results are saved to a file instead of kept inline.
-# 100K chars ≈ 25K tokens — generous for any reasonable output but prevents
-# catastrophic context explosions.
-_LARGE_RESULT_CHARS = 100_000
-
-# How many characters of the original result to include as an inline preview
-# so the model has immediate context about what the tool returned.
-_LARGE_RESULT_PREVIEW_CHARS = 1_500
-
-
-def _save_oversized_tool_result(function_name: str, function_result: str) -> str:
-    """Replace oversized tool results with a file reference + preview.
-
-    When a tool returns more than ``_LARGE_RESULT_CHARS`` characters, the full
-    content is written to a temporary file under ``HERMES_HOME/cache/tool_responses/``
-    and the result sent to the model is replaced with:
-      • a brief head preview  (first ``_LARGE_RESULT_PREVIEW_CHARS`` chars)
-      • the file path so the model can use ``read_file`` / ``search_files``
-
-    Falls back to destructive truncation if the file write fails.
-    """
-    original_len = len(function_result)
-    if original_len <= _LARGE_RESULT_CHARS:
-        return function_result
-
-    # Build the target directory
-    try:
-        response_dir = os.path.join(get_hermes_home(), "cache", "tool_responses")
-        os.makedirs(response_dir, exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        # Sanitize tool name for use in filename
-        safe_name = re.sub(r"[^\w\-]", "_", function_name)[:40]
-        filename = f"{safe_name}_{timestamp}.txt"
-        filepath = os.path.join(response_dir, filename)
-
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(function_result)
-
-        preview = function_result[:_LARGE_RESULT_PREVIEW_CHARS]
-        return (
-            f"{preview}\n\n"
-            f"[Large tool response: {original_len:,} characters total — "
-            f"only the first {_LARGE_RESULT_PREVIEW_CHARS:,} shown above. "
-            f"Full output saved to: {filepath}\n"
-            f"Use read_file or search_files on that path to access the rest.]"
-        )
-    except Exception as exc:
-        # Fall back to destructive truncation if file write fails
-        logger.warning("Failed to save large tool result to file: %s", exc)
-        return (
-            function_result[:_LARGE_RESULT_CHARS]
-            + f"\n\n[Truncated: tool response was {original_len:,} chars, "
-            f"exceeding the {_LARGE_RESULT_CHARS:,} char limit. "
-            f"File save failed: {exc}]"
-        )
 
 
 class AIAgent:
@@ -1216,6 +1162,33 @@ class AIAgent:
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
         
+        # ── Ollama num_ctx injection ──
+        # Ollama defaults to 2048 context regardless of the model's capabilities.
+        # When running against an Ollama server, detect the model's max context
+        # and pass num_ctx on every chat request so the full window is used.
+        # User override: set model.ollama_num_ctx in config.yaml to cap VRAM use.
+        self._ollama_num_ctx: int | None = None
+        _ollama_num_ctx_override = None
+        if isinstance(_model_cfg, dict):
+            _ollama_num_ctx_override = _model_cfg.get("ollama_num_ctx")
+        if _ollama_num_ctx_override is not None:
+            try:
+                self._ollama_num_ctx = int(_ollama_num_ctx_override)
+            except (TypeError, ValueError):
+                logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
+        if self._ollama_num_ctx is None and self.base_url and is_local_endpoint(self.base_url):
+            try:
+                _detected = query_ollama_num_ctx(self.model, self.base_url)
+                if _detected and _detected > 0:
+                    self._ollama_num_ctx = _detected
+            except Exception as exc:
+                logger.debug("Ollama num_ctx detection failed: %s", exc)
+        if self._ollama_num_ctx and not self.quiet_mode:
+            logger.info(
+                "Ollama num_ctx: will request %d tokens (model max from /api/show)",
+                self._ollama_num_ctx,
+            )
+
         if not self.quiet_mode:
             if compression_enabled:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (compress at {int(compression_threshold*100)}% = {self.context_compressor.threshold_tokens:,})")
@@ -5456,6 +5429,15 @@ class AIAgent:
         if _is_nous:
             extra_body["tags"] = ["product=hermes-agent"]
 
+        # Ollama num_ctx: override the 2048 default so the model actually
+        # uses the context window it was trained for.  Passed via the OpenAI
+        # SDK's extra_body → options.num_ctx, which Ollama's OpenAI-compat
+        # endpoint forwards to the runner as --ctx-size.
+        if self._ollama_num_ctx:
+            options = extra_body.get("options", {})
+            options["num_ctx"] = self._ollama_num_ctx
+            extra_body["options"] = options
+
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
@@ -6224,21 +6206,29 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
-            # Save oversized results to file instead of destructive truncation
-            function_result = _save_oversized_tool_result(name, function_result)
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=name,
+                tool_use_id=tc.id,
+                env=get_active_env(effective_task_id),
+            )
 
-            # Discover subdirectory context files from tool arguments
             subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
             if subdir_hints:
                 function_result += subdir_hints
 
-            # Append tool result message in order
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
                 "tool_call_id": tc.id,
             }
             messages.append(tool_msg)
+
+        # ── Per-turn aggregate budget enforcement ─────────────────────────
+        num_tools = len(parsed_calls)
+        if num_tools > 0:
+            turn_tool_msgs = messages[-num_tools:]
+            enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id))
 
         # ── Budget pressure injection ────────────────────────────────────
         budget_warning = self._get_budget_warning(api_call_count)
@@ -6524,8 +6514,12 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
-            # Save oversized results to file instead of destructive truncation
-            function_result = _save_oversized_tool_result(function_name, function_result)
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                env=get_active_env(effective_task_id),
+            )
 
             # Discover subdirectory context files from tool arguments
             subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
@@ -6562,6 +6556,11 @@ class AIAgent:
 
             if self.tool_delay > 0 and i < len(assistant_message.tool_calls):
                 time.sleep(self.tool_delay)
+
+        # ── Per-turn aggregate budget enforcement ─────────────────────────
+        num_tools_seq = len(assistant_message.tool_calls)
+        if num_tools_seq > 0:
+            enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))
 
         # ── Budget pressure injection ─────────────────────────────────
         # After all tool calls in this turn are processed, check if we're
@@ -7391,20 +7390,30 @@ class AIAgent:
                             response_invalid = True
                             error_details.append("response.output is not a list")
                         elif not output_items:
-                            # If we reach here, _run_codex_stream's backfill
-                            # from output_item.done events and text-delta
-                            # synthesis both failed to populate output.
-                            _resp_status = getattr(response, "status", None)
-                            _resp_incomplete = getattr(response, "incomplete_details", None)
-                            logging.warning(
-                                "Codex response.output is empty after stream backfill "
-                                "(status=%s, incomplete_details=%s, model=%s). %s",
-                                _resp_status, _resp_incomplete,
-                                getattr(response, "model", None),
-                                f"api_mode={self.api_mode} provider={self.provider}",
-                            )
-                            response_invalid = True
-                            error_details.append("response.output is empty")
+                            # Stream backfill may have failed, but
+                            # _normalize_codex_response can still recover
+                            # from response.output_text. Only mark invalid
+                            # when that fallback is also absent.
+                            _out_text = getattr(response, "output_text", None)
+                            _out_text_stripped = _out_text.strip() if isinstance(_out_text, str) else ""
+                            if _out_text_stripped:
+                                logger.debug(
+                                    "Codex response.output is empty but output_text is present "
+                                    "(%d chars); deferring to normalization.",
+                                    len(_out_text_stripped),
+                                )
+                            else:
+                                _resp_status = getattr(response, "status", None)
+                                _resp_incomplete = getattr(response, "incomplete_details", None)
+                                logger.warning(
+                                    "Codex response.output is empty after stream backfill "
+                                    "(status=%s, incomplete_details=%s, model=%s). %s",
+                                    _resp_status, _resp_incomplete,
+                                    getattr(response, "model", None),
+                                    f"api_mode={self.api_mode} provider={self.provider}",
+                                )
+                                response_invalid = True
+                                error_details.append("response.output is empty")
                     elif self.api_mode == "anthropic_messages":
                         content_blocks = getattr(response, "content", None) if response is not None else None
                         if response is None:
@@ -7494,7 +7503,8 @@ class AIAgent:
                             }
                         
                         # Longer backoff for rate limiting (likely cause of None choices)
-                        wait_time = min(5 * (2 ** (retry_count - 1)), 120)  # 5s, 10s, 20s, 40s, 80s, 120s
+                        # Jittered exponential: 5s base, 120s cap + random jitter
+                        wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
                         self._vprint(f"{self.log_prefix}⏳ Retrying in {wait_time}s (extended backoff for possible rate limit)...", force=True)
                         logging.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                         
@@ -8351,7 +8361,7 @@ class AIAgent:
                                     _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
                                 except (TypeError, ValueError):
                                     pass
-                    wait_time = _retry_after if _retry_after else min(2 ** retry_count, 60)
+                    wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                     if is_rate_limited:
                         self._emit_status(f"⏱️ Rate limit reached. Waiting {wait_time}s before retry (attempt {retry_count + 1}/{max_retries})...")
                     else:

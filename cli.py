@@ -5804,6 +5804,14 @@ class HermesCLI:
             self._handle_skin_command(cmd_original)
         elif canonical == "voice":
             self._handle_voice_command(cmd_original)
+        elif canonical == "review":
+            self._handle_review_command(cmd_original)
+        elif canonical == "fix":
+            self._handle_fix_command(cmd_original)
+        elif canonical == "review-arch":
+            self._handle_review_arch_command(cmd_original)
+        elif canonical == "review-security":
+            self._handle_review_security_command(cmd_original)
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
@@ -7671,6 +7679,220 @@ class HermesCLI:
         state["response_queue"].put(chosen)
         self._approval_state = None
         self._invalidate()
+
+    # =========================================================================
+    # Code Review Commands
+    # =========================================================================
+
+    def _handle_review_command(self, cmd_original: str):
+        """Handle /review command for Python code review."""
+        # Parse arguments: [PROJECT_ROOT] [SCOPE]
+        parts = cmd_original.strip().split(maxsplit=2)
+        project_root = None
+        scope = "staged"
+        
+        if len(parts) > 1:
+            arg1 = parts[1]
+            if arg1.startswith("--"):
+                # Flag, ignore
+                pass
+            elif os.path.exists(arg1):
+                project_root = arg1
+            else:
+                scope = arg1
+        
+        if len(parts) > 2:
+            arg2 = parts[2]
+            if os.path.exists(arg2) and project_root:
+                scope = arg2
+            elif not project_root:
+                project_root = arg2
+        
+        # Default to current directory
+        if not project_root:
+            project_root = os.getcwd()
+        
+        # Expand ~
+        project_root = os.path.expanduser(project_root)
+        
+        # Show what we're doing
+        _cprint(f"\n{_ACCENT}Code Review{_RST}")
+        _cprint(f"  {_DIM}Project: {project_root}{_RST}")
+        _cprint(f"  {_DIM}Scope: {scope}{_RST}")
+        _cprint("")
+        
+        # Trigger the agent to perform the review
+        prompt = f"""
+I want to review Python code using the code-review-agent skill.
+
+Project: {project_root}
+Scope: {scope}
+
+Please:
+1. Detect the project type (Django, FastAPI, Flask, library, etc.)
+2. Identify the files to review based on the scope
+3. Apply the Python review checklists (correctness, security, architecture, design, testing, performance, code smells)
+4. Generate a structured report with Critical/Warning/Suggestion categories
+5. Offer to save the review to Trilium
+6. If issues are found, offer to apply fixes (with test verification)
+
+Use the code-review-agent skill for this review.
+"""
+        self.chat(prompt)
+
+    def _handle_fix_command(self, cmd_original: str):
+        """Handle /fix command for auto-fixing Python code issues."""
+        # Parse arguments: [PROJECT_ROOT] [--critical|--dry-run]
+        parts = cmd_original.strip().split()
+        project_root = None
+        critical_only = False
+        dry_run = False
+        
+        for part in parts[1:]:
+            if part == "--critical":
+                critical_only = True
+            elif part == "--dry-run":
+                dry_run = True
+            elif os.path.exists(part):
+                project_root = part
+        
+        # Default to current directory
+        if not project_root:
+            project_root = os.getcwd()
+        
+        # Expand ~
+        project_root = os.path.expanduser(project_root)
+        
+        # Show what we're doing
+        _cprint(f"\n{_ACCENT}Auto-Fix Issues{_RST}")
+        _cprint(f"  {_DIM}Project: {project_root}{_RST}")
+        if critical_only:
+            _cprint(f"  {_DIM}Mode: Critical issues only{_RST}")
+        if dry_run:
+            _cprint(f"  {_DIM}Mode: Dry run (preview only){_RST}")
+        _cprint("")
+        
+        # Trigger the agent to perform fixes
+        prompt = f"""
+I want to auto-fix Python code issues using the code-review-agent skill.
+
+Project: {project_root}
+Mode: {'Critical only' if critical_only else 'All issues'}
+{'Dry run - do not apply fixes, only show what would be fixed' if dry_run else 'Apply fixes after confirmation'}
+
+Please:
+1. First run a code review to identify issues
+2. Show me the findings with severity levels
+3. {'Only show critical fixes' if critical_only else 'Show all fixes'}
+4. For each fix, show a before/after diff
+5. {'Show what would be fixed but do not apply' if dry_run else 'Ask for confirmation before applying each fix'}
+6. {'Skip test execution' if dry_run else 'Run tests before and after fixes to verify no regressions'}
+7. Save results to Trilium
+
+Use the code-review-agent skill. Apply moderate confidence auto-fixes (style, simple refactoring, obvious bugs). Do not make architectural changes without explicit approval.
+"""
+        self.chat(prompt)
+
+    def _handle_review_arch_command(self, cmd_original: str):
+        """Handle /review-arch command for architecture analysis."""
+        # Parse arguments: [PROJECT_ROOT] [SUBDIR]
+        parts = cmd_original.strip().split(maxsplit=2)
+        project_root = None
+        subdir = "."
+        
+        if len(parts) > 1:
+            arg1 = parts[1]
+            if os.path.exists(arg1):
+                if os.path.isdir(os.path.join(arg1, ".")):
+                    project_root = arg1
+                else:
+                    # Could be subdir of current dir
+                    if os.path.isdir(arg1):
+                        subdir = arg1
+        
+        if len(parts) > 2 and project_root:
+            subdir = parts[2]
+        
+        # Default to current directory
+        if not project_root:
+            project_root = os.getcwd()
+        
+        # Expand ~
+        project_root = os.path.expanduser(project_root)
+        
+        # Show what we're doing
+        _cprint(f"\n{_ACCENT}Architecture Analysis{_RST}")
+        _cprint(f"  {_DIM}Project: {project_root}{_RST}")
+        _cprint(f"  {_DIM}Subdirectory: {subdir}{_RST}")
+        _cprint("")
+        
+        # Trigger the agent
+        prompt = f"""
+I want to analyze the architecture of a Python project using the code-review-agent skill.
+
+Project: {project_root}
+Subdirectory: {subdir}
+
+Please:
+1. Detect the project type
+2. Analyze module structure and metrics (lines, functions, complexity)
+3. Check for circular imports
+4. Identify coupling issues between modules
+5. Find large files/classes that should be split
+6. Check for architecture anti-patterns (god classes, feature envy, data clumps)
+7. Review module organization and layer boundaries
+8. Generate recommendations for architectural improvements
+9. Save analysis to Trilium
+
+Use the code-review-agent skill and its architecture patterns reference.
+"""
+        self.chat(prompt)
+
+    def _handle_review_security_command(self, cmd_original: str):
+        """Handle /review-security command for security audit."""
+        # Parse arguments: [PROJECT_ROOT]
+        parts = cmd_original.strip().split(maxsplit=1)
+        project_root = None
+        
+        if len(parts) > 1:
+            arg1 = parts[1]
+            if os.path.exists(arg1):
+                project_root = arg1
+        
+        # Default to current directory
+        if not project_root:
+            project_root = os.getcwd()
+        
+        # Expand ~
+        project_root = os.path.expanduser(project_root)
+        
+        # Show what we're doing
+        _cprint(f"\n{_ACCENT}Security Audit{_RST}")
+        _cprint(f"  {_DIM}Project: {project_root}{_RST}")
+        _cprint("")
+        
+        # Trigger the agent
+        prompt = f"""
+I want to perform a security audit on a Python project using the code-review-agent skill.
+
+Project: {project_root}
+
+Please:
+1. Scan for hardcoded secrets, API keys, passwords
+2. Check for SQL injection vulnerabilities
+3. Look for path traversal issues
+4. Find unsafe eval/exec/pickle usage
+5. Check input validation on user-facing functions
+6. Review authentication/authorization checks
+7. Check for sensitive data in logs
+8. Look for insecure deserialization
+9. Generate a security report with severity levels
+10. Offer to fix security issues (with test verification)
+11. Save audit results to Trilium
+
+Use the code-review-agent skill security checklist.
+"""
+        self.chat(prompt)
 
     def _get_approval_display_fragments(self):
         """Render the dangerous-command approval panel for the prompt_toolkit UI.

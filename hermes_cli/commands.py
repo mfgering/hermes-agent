@@ -143,6 +143,16 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
 
+    # Development
+    CommandDef("review", "Review Python code for issues", "Development",
+               aliases=("rev",), args_hint="[PROJECT_ROOT] [staged|unstaged|file|dir]"),
+    CommandDef("fix", "Auto-fix Python code issues", "Development",
+               aliases=("autofix",), args_hint="[PROJECT_ROOT] [--critical|--dry-run]"),
+    CommandDef("review-arch", "Analyze code architecture", "Development",
+               aliases=("arch",), args_hint="[PROJECT_ROOT] [subdir]"),
+    CommandDef("review-security", "Security audit", "Development",
+               aliases=("sec",), args_hint="[PROJECT_ROOT]"),
+
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",
                gateway_only=True, args_hint="[page]"),
